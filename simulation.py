@@ -1,272 +1,374 @@
-import os
-import builtins
-import random
-import simpy
+# simulation.py
+"""
+SimPy RPL rank-attack simulator (paper-aligned) — full file.
+Outputs: output.txt, topology.png, energy.png
+"""
+
+import os, random, math, builtins
 import matplotlib.pyplot as plt
+import simpy
 
-# Delete output files if they exist
-for filename in ['output.txt', 'output.png']:
-    if os.path.exists(filename):
-        os.remove(filename)
+# ---------------------------
+# Cleanup / Logging
+# ---------------------------
+for fn in ("output.txt", "topology.png", "energy.png"):
+    if os.path.exists(fn):
+        os.remove(fn)
 
-# Function to log messages to a file and print them to stdout
 def log(*args, **kwargs):
-    with open('output.txt', 'a') as f:
+    with open("output.txt", "a") as f:
         builtins.print(*args, **kwargs, file=f)
     builtins.print(*args, **kwargs)
 
-# Function to configure simulation parameters
-def configure_simulation():
-    print("Using default simulation parameters")
-    config = {
-        "RANDOM_SEED": 1111,
-        "NUM_NODES": 50,
-        "AREA_WIDTH": 125,
-        "AREA_HEIGHT": 125,
-        "MINIMUM_DISTANCE": 5,
-        "CONNECTION_RANGE": 15,
-        "DIO_INTERVAL": 10,
-        "NODE_CREATION_INTERVAL": 1,
-        "RUNTIME": 120
-    }
-    configure = input("Do you want to configure simulation parameters? y/[N]: ")
-    if configure.lower() == 'y':
-        config["RANDOM_SEED"] = int(input("Enter Random Seed [1111]: ") or config["RANDOM_SEED"])
-        config["NUM_NODES"] = int(input("Enter Number of Nodes [50]: ") or config["NUM_NODES"])
-        config["AREA_WIDTH"] = int(input("Enter Area Width in Meters [125]: ") or config["AREA_WIDTH"])
-        config["AREA_HEIGHT"] = int(input("Enter Area Height in Meters [125]: ") or config["AREA_HEIGHT"])
-        config["MINIMUM_DISTANCE"] = int(input("Enter Minimum Distance Between Nodes in Meters [5]: ") or config["MINIMUM_DISTANCE"])
-        config["CONNECTION_RANGE"] = int(input("Enter Connection Range in Meters [15]: ") or config["CONNECTION_RANGE"])
-        config["DIO_INTERVAL"] = int(input("Enter DIO Interval in Seconds [10]: ") or config["DIO_INTERVAL"])
-        config["NODE_CREATION_INTERVAL"] = int(input("Enter Node Creation Interval in Seconds [1]: ") or config["NODE_CREATION_INTERVAL"])
-        config["RUNTIME"] = int(input("Enter Simulation Runtime in Seconds [120]: ") or config["RUNTIME"])
-    return config
+# ---------------------------
+# Config (paper values + options)
+# ---------------------------
+FAST_MODE = True            
+RANDOM_SEED = 300
+random.seed(RANDOM_SEED)
 
-# Initialize random seed
-config = configure_simulation()
-random.seed(config["RANDOM_SEED"])
+AREA_W = 110.0
+AREA_H = 110.0
+TX_RANGE = 50.0
+INTF_RANGE = 60.0
+RECEP_MIN = 0.30
+RECEP_MAX = 1.00
+START_DELAY = 0.5  
 
+VOLTAGE = 3.0
+TICKS_PER_SEC = 32768
+
+DIO_INTERVAL = 10.0    
+DATA_INTERVAL = 30.0   
+TX_DURATION_DIO = 0.02
+TX_DURATION_DATA = 0.001
+RX_DURATION = 0.001
+CPU_DURATION = 0.0005
+
+SCENARIOS = {
+    "rank_increase": {"normal": 12, "attackers": 1, "mitigation": 0, "runtime": 3600},
+    "rank_decrease": {"normal": 8, "attackers": 1, "mitigation": 0, "runtime": 3600},
+    "worst_parent": {"normal": 12, "attackers": 1, "mitigation": 0, "runtime": 1200},
+    "mitigation": {"normal": 7, "attackers": 3, "mitigation": 3, "runtime": 4320},
+    "none": {"normal": 9, "attackers": 0, "mitigation": 0, "runtime": 3600}
+}
+
+ATTACK_MODE = "none"   
+scenario = SCENARIOS[ATTACK_MODE]
+
+def reception_prob(distance):
+    """Return probability packet is received given distance (30%-100% paper)."""
+    if distance <= TX_RANGE:
+        dist_factor = 1.0 - (distance / TX_RANGE) * (1.0 - RECEP_MIN)
+        return max(0.0, min(1.0, dist_factor * random.uniform(RECEP_MIN, RECEP_MAX)))
+    elif distance <= INTF_RANGE:
+        frac = 1.0 - ((distance - TX_RANGE) / (INTF_RANGE - TX_RANGE))
+        return max(0.0, RECEP_MIN * 0.5 * frac * random.uniform(RECEP_MIN, RECEP_MAX))
+    return 0.0
+
+# ---------------------------
+# Node class
+# ---------------------------
 class Node:
-    def __init__(self, env, node_id, position, all_nodes):
-        # Environment
+    def __init__(self, env, nid, pos, role="normal"):
         self.env = env
+        self.id = nid
+        self.pos = pos
+        self.role = role            # 'normal', 'attacker', 'mitigation', 'sink'
+        self.neigh = []             # discovered neighbor nodes
+        self.parent = None          # chosen parent (Node)
+        self.advertised_rank = 1000 # numeric rank (lower = better)
+        self.is_attacker = (role == "attacker")
+        self.attack_active = False
 
-        # Node Information
-        self.parent = None
-        self.node_id = node_id
-        self.position = position
-        self.all_nodes = all_nodes
-        self.neighbors = []
-        self.lost_neighbors = []
+        # energy accounting (seconds)
+        self.tx_time = 0.0
+        self.rx_time = 0.0
+        self.cpu_time = 0.0
+        self.lpm_time = 0.0
+        self.energy_mJ = 0.0
 
-        # Network Prefix
-        self.prefix = f'2001:db8::{int(node_id[4:]):02x}'
+        # traffic counters
+        self.pkts_sent = 0
+        self.pkts_forwarded = 0
+        self.pkts_recvd = 0
 
-        # Trickle Parameters
-        self.Imin = 1
-        self.Imax = 10
-        self.I = self.Imin
-        self.t = random.uniform(self.Imin, self.I)
+    def distance(self, other):
+        return math.hypot(self.pos[0]-other.pos[0], self.pos[1]-other.pos[1])
 
-        # Color for Plotting
-        self.color = (random.random(), random.random(), random.random())
-
-    def discover_neighbors(self):
-        # Initiate neighbor discovery process
-        log(f'{self.env.now:.2f} {self.node_id} starting neighbor discovery')
-        yield self.env.timeout(0.1)  # Simulate delay for sending DIS
-        for node in self.all_nodes:
-            if node != self and self.calculate_distance(node.position) <= config["CONNECTION_RANGE"]:
-                self.env.process(node.receive_dis(self))
-                log(f'{self.env.now:.2f} {self.node_id} sends DIS to {node.node_id}')
-
-    def send_dio(self):
-        # Send DIO message to all neighbors
+    # DIO process: advertise rank to neighbors
+    def dio_process(self):
+        yield self.env.timeout(START_DELAY)
         while True:
-            for neighbor in self.neighbors:
-                if neighbor.parent != self:
-                    self.env.process(neighbor.receive_dio(self))
-                    log(f'{self.env.now:.2f} {self.node_id} sends DIO to {neighbor.node_id}')
-            yield self.env.timeout(config["DIO_INTERVAL"])
-    
-    def receive_dio(self, sender):
-        own_prefix = f':{int(self.node_id[4:]):02x}'
-        cycle = False
-        if own_prefix in sender.prefix:
-            cycle = True
-        # Receive DIO message from a neighbor, avoid cycles
-        if cycle == False:
-            if not self.parent:
-                # Update parent and prefix
-                self.parent = sender
-                self.prefix = f'{sender.prefix}:{int(self.node_id[4:]):02x}'
-                yield self.env.process(self.send_dao())
-                log(f'{self.env.now:.2f} {self.node_id} received DIO from new parent {sender.node_id}; new prefix: {self.prefix}')
-            else:
-                # Check if sender is a Closer parent
-                if sender.parent != self and self.calculate_distance(sender.position) < self.calculate_distance(self.parent.position) and sender.parent != self:
-                    # Update parent and prefix
-                    self.parent = sender
-                    self.prefix = f'{sender.prefix}:{int(self.node_id[4:]):02x}'
-                    yield self.env.process(self.send_dao())
-                    log(f'{self.env.now:.2f} {self.node_id} received DIO from closer parent {sender.node_id}; new prefix: {self.prefix}')
+            adv = self.advertised_rank
+            if self.is_attacker and self.attack_active:
+                if ATTACK_MODE == "rank_increase":
+                    adv = 1   # make attacker appear very attractive / low rank
+                elif ATTACK_MODE == "rank_decrease":
+                    adv = 0
+                elif ATTACK_MODE == "worst_parent":
+                    adv = self.advertised_rank
 
-        yield self.env.timeout(0)
-    
-    def send_dis(self):
-        if not self.neighbors:
-            for node in self.all_nodes:
-                if node != self and self.calculate_distance(node.position) <= config["CONNECTION_RANGE"]:
-                    self.env.process(node.receive_dis(self))
-        yield self.env.timeout(0)
+            # broadcast to neighbors: attempt delivery per neighbor
+            for nb in self.neigh:
+                d = self.distance(nb)
+                p = reception_prob(d)
+                # sender always attempts transmit -> count TX time
+                self._tx(TX_DURATION_DIO)
+                # receiver only charges RX/CPU if it actually receives the DIO
+                if random.random() < p:
+                    nb._rx(RX_DURATION); nb._cpu(CPU_DURATION)
+                    nb.evaluate_parent(candidate=self, candidate_rank=adv)
+            # DIO interval: attackers may spam
+            interval = DIO_INTERVAL
+            if self.is_attacker and self.attack_active:
+                if ATTACK_MODE == "rank_increase":
+                    interval = max(0.5, DIO_INTERVAL/6.0)
+                elif ATTACK_MODE == "rank_decrease":
+                    interval = max(0.5, DIO_INTERVAL/4.0)
+            yield self.env.timeout(interval)
 
-    def receive_dis(self, sender):
-        # Receive DIS message from a neighbor and send DIO message
-        distance = self.calculate_distance(sender.position)
-        if sender not in self.neighbors and distance <= config["CONNECTION_RANGE"]:
-            self.neighbors.append(sender) if sender not in self.neighbors else None
-            sender.neighbors.append(self) if self not in sender.neighbors else None
-            self.env.process(sender.receive_dio(self))
-            log(f'{self.env.now:.2f} {self.node_id} received DIS from {sender.node_id}; new neighbor: {sender.node_id}')
-        yield self.env.timeout(0.1)
+    # Parent selection metric & switching
+    def evaluate_parent(self, candidate, candidate_rank):
+        if self.role == "sink":
+            return
 
-    def send_dao(self):
-        # Send DAO message to parent
-        if self.parent:
-            log(f'{self.env.now:.2f} {self.node_id} sends DAO to {self.parent.node_id}, Prefix: {self.prefix}')
-            yield self.env.process(self.parent.receive_dao(self.prefix, self))  # Ensure using 'yield'
-    
-    def receive_dao(self, prefix, child):
-        # Reject route if cycle detected
-        child_prefix = f':{int(child.node_id[4:]):02x}'
-        cycle = False
-        if child_prefix in prefix:
-            log(f'{self.env.now:.2f} {self.node_id} received DAO from {child.node_id} with cycle, Prefix: {prefix}')
-            cycle = True
-        # Receive DAO message from child and forward to parent
-        if self.parent and not cycle:
-            child.prefix = f'{child.parent.prefix}:{int(child.node_id[4:]):02x}'
-            self.env.process(self.parent.receive_dao(prefix, self))
-            log(f'{self.env.now:.2f} {self.node_id} received DAO from {child.node_id}, Prefix: {prefix}')
+        # avoid loops
+        cursor = candidate
+        while cursor is not None:
+            if cursor == self:
+                return
+            cursor = cursor.parent
 
-        yield self.env.timeout(0)  # Ensure this function is a generator
+        if self.role == "mitigation" and candidate.is_attacker and candidate.attack_active:
+            return
 
-    def calculate_distance(self, other_position):
-        # Calculate distance between this node and another node
-        return ((self.position[0] - other_position[0])**2 + (self.position[1] - other_position[1])**2)**0.5
-    
-    def reset_trickle(self):
-        # Reset Trickle parameters
-        self.I = self.Imin
-        self.t = random.uniform(self.Imin, self.I)
+        d = self.distance(candidate)
+        if d > INTF_RANGE:
+            return
+        metric = candidate_rank + (d / TX_RANGE)
+        cur_metric = getattr(self.parent, "candidate_metric_cache", 1e9) if self.parent else 1e9
+        if metric + 1e-9 < cur_metric:
+            self.parent = candidate
+            self.parent.candidate_metric_cache = metric
+            if not FAST_MODE:
+                log(f"{self.env.now:.2f}s {self.id} selects parent {candidate.id} metric={metric:.3f}")
 
-    def trickle_timer(self):
-        # Trickle timer for sending DIS messages
+
+    # Data generation and hop-by-hop forwarding (aggregated simulation)
+    def data_process(self, sink, pkt_interval=DATA_INTERVAL):
+        yield self.env.timeout(START_DELAY + random.uniform(0, 1.0))
         while True:
-            yield self.env.timeout(self.t)
-            if not self.neighbors:
-                yield self.env.process(self.send_dis())
-                log(f'{self.env.now:.2f} {self.node_id} sends DIS broadcast for neighbor discovery')
-            self.I = min(self.I * 2, self.Imax)
-            self.t = random.uniform(self.Imin, self.I)
-
-    def network_disruption(self):
-        # Simulate network disruption by removing all neighbors 
-        # 1/20 chances of network disruption every 5 seconds
-        while True:
-            yield self.env.timeout(self.t)
-            if random.random() < (1/100):
-                log(f'{self.env.now:.2f} {self.node_id} network disruption')
-                self.lost_neighbors.clear()
-
-                # Remove self from neighbors
-                for neighbor in self.neighbors:
-                    if self in neighbor.neighbors:
-                        neighbor.neighbors.remove(self)
-                
-                # Add all neighbors to lost_neighbors
-                for neighbor in self.neighbors:
-                    self.lost_neighbors.append(neighbor)
-                
-                # Clear neighbors
-                self.neighbors.clear()
-
-                # Re-Discover neighbors
-                yield self.env.process(self.discover_neighbors())
-
-def setup_environment(num_nodes, width, height):
-    env = simpy.Environment()
-    nodes = []
-
-    def create_nodes():
-        for i in range(num_nodes):
-            position = (round(random.uniform(0, width), 4), round(random.uniform(0, height), 4))
-
-            valid_position = False
-            while not valid_position:
-                valid_position = True
-                for node in nodes:
-                    if node.calculate_distance(position) < config["MINIMUM_DISTANCE"]:
-                        valid_position = False
-                        position = (round(random.uniform(0, width), 4), round(random.uniform(0, height), 4))
+            if self.role in ("normal", "mitigation"):
+                self.pkts_sent += 1
+                sender = self
+                success = True
+                hop = 0
+                while sender is not None and sender != sink:
+                    receiver = sender.parent
+                    if receiver is None:
+                        success = False
                         break
+                    d = sender.distance(receiver)
+                    p = reception_prob(d)
+                    # attempt transmission: charge tx for sender
+                    sender._tx(TX_DURATION_DATA)
+                    # success check: if delivered, receiver charges rx/cpu and forwarding happens
+                    if random.random() < p:
+                        receiver._rx(RX_DURATION); receiver._cpu(CPU_DURATION)
+                        sender.pkts_forwarded += 1
+                        receiver.pkts_recvd += 1
+                        # attacker behaviors
+                        if receiver.is_attacker and receiver.attack_active:
+                            if ATTACK_MODE == "rank_decrease":
+                                # drop with probability (isolation)
+                                if random.random() < 0.7:
+                                    success = False
+                                    if not FAST_MODE:
+                                        log(f"{self.env.now:.2f}s pkt dropped by attacker {receiver.id}")
+                                    break
+                            elif ATTACK_MODE == "worst_parent":
+                                if receiver.neigh:
+                                    worst = max(receiver.neigh, key=lambda n: receiver.distance(n))
+                                    receiver.parent = worst
+                                    if not FAST_MODE:
+                                        log(f"{self.env.now:.2f}s attacker {receiver.id} forwards to worst {worst.id}")
+                            elif ATTACK_MODE == "rank_increase":
+                                # attacker forwards normally but its rank manipulation causes suboptimal parent selection elsewhere
+                                pass
+                        # advance along parent chain
+                        sender = receiver
+                        hop += 1
+                        if hop > 50:
+                            success = False
+                            break
+                    else:
+                        # no reception -> packet lost at this hop
+                        success = False
+                        break
+                if sender == sink:
+                    sink.pkts_recvd += 1
+                    if not FAST_MODE:
+                        log(f"{self.env.now:.2f}s pkt from {self.id} reached sink")
+            yield self.env.timeout(pkt_interval + random.uniform(0, 0.2))
 
-            node = Node(env, f'Node{i:02d}', position, nodes)
-            nodes.append(node)
-            env.process(node.discover_neighbors())
-            env.process(node.send_dio())
-            env.process(node.trickle_timer())
-            env.process(node.network_disruption())
-            log(f'{env.now:.2f} {node.node_id} created at {node.position}')
-            
-            yield env.timeout(config["NODE_CREATION_INTERVAL"])
+    # neighbor discovery: one-shot linking within interference range (probabilistic)
+    def neighbor_discovery_once(self, all_nodes):
+        for n in all_nodes:
+            if n is self: continue
+            d = self.distance(n)
+            if d <= INTF_RANGE and random.random() < 0.95:
+                self.neigh.append(n)
 
-    env.process(create_nodes())
-    return env, nodes
+    # Energy helpers
+    def _tx(self, secs):
+        self.tx_time += secs
+    def _rx(self, secs):
+        self.rx_time += secs
+    def _cpu(self, secs):
+        self.cpu_time += secs
 
-# Setup and start the simulation
-print('RPL Simulation')
-env, nodes = setup_environment(config["NUM_NODES"], config["AREA_WIDTH"], config["AREA_HEIGHT"])
-env.run(until=config["RUNTIME"])  # Extend runtime to ensure all nodes are created and can act
+    def finalize_energy(self, runtime):
+        active = self.tx_time + self.rx_time + self.cpu_time
+        lpm = max(0.0, runtime - active)
+        self.lpm_time = lpm
+        tx_ticks = int(round(self.tx_time * TICKS_PER_SEC))
+        rx_ticks = int(round(self.rx_time * TICKS_PER_SEC))
+        cpu_ticks = int(round(self.cpu_time * TICKS_PER_SEC))
+        lpm_ticks = int(round(self.lpm_time * TICKS_PER_SEC))
+        current_term = (tx_ticks * 19.5) + (rx_ticks * 21.5) + (cpu_ticks * 1.8) + (lpm_ticks * 0.0545)
+        energy_mJ = (current_term * VOLTAGE) / TICKS_PER_SEC
+        self.energy_mJ = energy_mJ
+        return energy_mJ
 
+# ---------------------------
+# Build network and bootstrap
+# ---------------------------
+def build_network(env):
+    nodes = []
+    idx = 0
 
-# Initialize a plot
-plt.figure(figsize=(8, 8))
-plt.title('Node Distribution in RPL Simulation')
-plt.xlabel('Width (meters)')
-plt.ylabel('Height (meters)')
+    # sink in center
+    sink = Node(env, f"N{idx}", (random.uniform(0, AREA_W), random.uniform(0, AREA_H)), role="sink")
+    sink.advertised_rank = 0
+    nodes.append(sink); idx += 1
 
-drawn_pair = []
-for node in nodes:
-    plt.scatter(node.position[0], node.position[1], color=node.color, label=node.node_id)
-    # circle = plt.Circle(node.position, config["CONNECTION_RANGE"], color=node.color, fill=False, alpha=0.1, linestyle='dotted', linewidth=0.25)
-    # plt.gca().add_artist(circle)
+    # normal nodes
+    for _ in range(scenario["normal"]):
+        pos = (random.uniform(0, AREA_W), random.uniform(0, AREA_H))
+        n = Node(env, f"N{idx}", pos, role="normal")
+        n.advertised_rank = random.uniform(5, 20)
+        nodes.append(n); idx += 1
 
-    # Node Name
-    node_name = node.node_id.replace('Node', 'N') + '\n' + node.prefix.replace('2001:db8::', '::')
-    bottom_padding = int(config["AREA_HEIGHT"]) * 0.05
-    plt.text(node.position[0], node.position[1] - bottom_padding, node_name, fontsize=6, ha='center', va='bottom', color=node.color)
+    # attackers
+    for _ in range(scenario["attackers"]):
+        pos = (random.uniform(0, AREA_W), random.uniform(0, AREA_H))
+        a = Node(env, f"N{idx}", pos, role="attacker")
+        a.advertised_rank = random.uniform(1, 50)
+        nodes.append(a); idx += 1
 
+    # mitigation nodes
+    for _ in range(scenario.get("mitigation", 0)):
+        pos = (random.uniform(0, AREA_W), random.uniform(0, AREA_H))
+        m = Node(env, f"N{idx}", pos, role="mitigation")
+        m.advertised_rank = random.uniform(5, 20)
+        nodes.append(m); idx += 1
+
+    # neighbor discovery (one-shot)
+    for n in nodes:
+        n.neighbor_discovery_once(nodes)
+
+    # bootstrap parent choices: evaluate once so parents exist before processes start
+    for n in nodes:
+        for nb in n.neigh:
+            n.evaluate_parent(candidate=nb, candidate_rank=nb.advertised_rank)
+
+    # start DIO and data processes
+    for n in nodes:
+        env.process(n.dio_process())
+        env.process(n.data_process(sink, pkt_interval=DATA_INTERVAL))
+    return nodes, sink
+
+# Attack controller: enable attacker behavior (adjust advertised_rank)
+def attack_controller(env, nodes):
+    attackers = [n for n in nodes if n.is_attacker]
+    if not attackers:
+        return
+    yield env.timeout(10.0)  # warmup
+    for a in attackers:
+        a.attack_active = True
+        if ATTACK_MODE in ("rank_increase", "rank_decrease"):
+            a.advertised_rank = 0
+        log(f"{env.now:.2f}s attacker {a.id} ACTIVATED (mode={ATTACK_MODE})")
+    # attacks remain active until simulation end
+    return
+
+# ---------------------------
+# Run simulation
+# ---------------------------
+def run():
+    env = simpy.Environment()
+    nodes, sink = build_network(env)
+
+    # start attack controller
+    env.process(attack_controller(env, nodes))
+
+    runtime = scenario["runtime"]
+    log("Scenario:", ATTACK_MODE, "nodes:", len(nodes), "runtime(s):", runtime)
+    env.run(until=runtime)
+
+    # metrics + finalize energy
+    total_energy = 0.0
+    for n in nodes:
+        e = n.finalize_energy(runtime)
+        total_energy += e
+        log(f"{n.id} role={n.role} TX={n.tx_time:.3f}s RX={n.rx_time:.3f}s CPU={n.cpu_time:.3f}s LPM={n.lpm_time:.3f}s ENERGY={e:.6f} mJ pkts_sent={n.pkts_sent} pkts_forwarded={n.pkts_forwarded} pkts_recvd={n.pkts_recvd}")
+    avg_energy = total_energy / len(nodes) if nodes else 0.0
+    total_pkts_sent = sum(n.pkts_sent for n in nodes)
+    pdr = (sink.pkts_recvd / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
+    log(f"SUM_ENERGY={total_energy:.6f} mJ AVG_ENERGY={avg_energy:.6f} mJ PDR={pdr:.2f}%")
+
+    # quick totals sanity
+    total_tx = sum(n.tx_time for n in nodes)
+    total_rx = sum(n.rx_time for n in nodes)
+    log(f"TOTALS TX={total_tx:.3f}s RX={total_rx:.3f}s PKTS_SENT={total_pkts_sent} PKTS_RECV_AT_SINK={sink.pkts_recvd}")
+
+    # plots
+    plt.figure(figsize=(7,7))
+    for n in nodes:
+        if n.role == "sink":
+            s = 160; c = "green"
+        elif n.role == "attacker":
+            s = 120; c = "red"
+        elif n.role == "mitigation":
+            s = 100; c = "orange"
+        else:
+            s = 60; c = "blue"
+        plt.scatter(n.pos[0], n.pos[1], s=s, c=c)
+        plt.text(n.pos[0], n.pos[1]-1.5, n.id, fontsize=6, ha='center')
+        for nb in n.neigh:
+            plt.plot([n.pos[0], nb.pos[0]], [n.pos[1], nb.pos[1]], color="0.85", linewidth=0.4)
+    plt.xlim(0, AREA_W); plt.ylim(0, AREA_H); plt.gca().set_aspect('equal', adjustable='box')
+    plt.title(f"Topology: {ATTACK_MODE} (sink green, attacker red)")
+    plt.savefig("topology.png", dpi=300)
+    plt.close()
+    for n in nodes:
+        children = [x.id for x in nodes if x.parent == n]
+        if children:
+            log(f"{n.id} has children: {children}")
+
+    # energy bar
+    ids = [n.id for n in nodes]
+    energies = [n.energy_mJ for n in nodes]
+    order = sorted(range(len(ids)), key=lambda i: energies[i], reverse=True)
+    plt.figure(figsize=(10,4))
+    plt.bar(range(len(ids)), [energies[i] for i in order])
+    plt.xticks(range(len(ids)), [ids[i] for i in order], rotation=90, fontsize=6)
+    plt.ylabel("Energy (mJ)")
+    plt.title(f"Energy per node (PDR {pdr:.2f}%)")
+    plt.tight_layout(); plt.savefig("energy.png", dpi=300); plt.close()
+    log("Saved topology.png and energy.png")
     
-    connected_neighbors = [neighbor for neighbor in node.neighbors if neighbor in nodes]
-    for neighbor in connected_neighbors:
-        if (node.node_id, neighbor.node_id) in drawn_pair or (neighbor.node_id, node.node_id) in drawn_pair:
-            continue
-        plt.plot([node.position[0], neighbor.position[0]], [node.position[1], neighbor.position[1]], color='blue', alpha=0.75, linestyle='dotted', linewidth=0.75)
-        drawn_pair.append((node.node_id, neighbor.node_id))
 
-    # Currently Lost Neighbors: lost_neighbors - neighbors
-    lost_neighbors = [neighbor for neighbor in node.lost_neighbors] # if neighbor not in connected_neighbors]
-    for neighbor in lost_neighbors:
-        # if (node, neighbor) in drawn_pair or (neighbor, node) in drawn_pair:
-        #     continue
-        plt.plot([node.position[0], neighbor.position[0]], [node.position[1], neighbor.position[1]], color='red', alpha=0.25, linestyle='solid', linewidth=0.75)
-        drawn_pair.append((node, neighbor))
-
-# Show plot
-plt.xlim(0, config["AREA_WIDTH"])
-plt.ylim(0, config["AREA_HEIGHT"])
-plt.gca().set_aspect('equal', adjustable='box')
-plt.grid(False)
-plt.savefig('output.png', transparent=False, dpi=300)
-plt.close()
+if __name__ == "__main__":
+    run()
