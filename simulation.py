@@ -10,6 +10,7 @@ import math
 import builtins
 import matplotlib.pyplot as plt
 import simpy
+import numpy as np
 
 # ---------------------------
 # Cleanup / Logging
@@ -19,10 +20,10 @@ for fn in ("output.txt", "topology.png", "energy.png"):
         os.remove(fn)
 
 
-def log(*args, **kwargs):
-    with open("output.txt", "a") as f:
-        builtins.print(*args, **kwargs, file=f)
-    builtins.print(*args, **kwargs)
+# def log(*args, **kwargs):
+#     with open("output.txt", "a") as f:
+#         builtins.print(*args, **kwargs, file=f)
+#     builtins.print(*args, **kwargs)
 
 
 # ---------------------------
@@ -165,10 +166,10 @@ class Node:
         if metric + 1e-9 < cur_metric:
             self.parent = candidate
             self.parent.candidate_metric_cache = metric
-            if not FAST_MODE:
-                log(
-                    f"{self.env.now:.2f}s {self.id} selects parent {candidate.id} metric={metric:.3f}"
-                )
+            # if not FAST_MODE:
+                # log(
+                #     f"{self.env.now:.2f}s {self.id} selects parent {candidate.id} metric={metric:.3f}"
+                # )
 
     # Data generation and hop-by-hop forwarding (aggregated simulation)
     def data_process(self, sink, ATTACK_MODE, pkt_interval=DATA_INTERVAL, ):
@@ -200,10 +201,10 @@ class Node:
                                 # drop with probability (isolation)
                                 if random.random() < 0.7:
                                     success = False
-                                    if not FAST_MODE:
-                                        log(
-                                            f"{self.env.now:.2f}s pkt dropped by attacker {receiver.id}"
-                                        )
+                                    # if not FAST_MODE:
+                                        # log(
+                                        #     f"{self.env.now:.2f}s pkt dropped by attacker {receiver.id}"
+                                        # )
                                     break
                             elif ATTACK_MODE == "worst_parent":
                                 if receiver.neigh:
@@ -212,10 +213,10 @@ class Node:
                                         key=lambda n: receiver.distance(n),
                                     )
                                     receiver.parent = worst
-                                    if not FAST_MODE:
-                                        log(
-                                            f"{self.env.now:.2f}s attacker {receiver.id} forwards to worst {worst.id}"
-                                        )
+                                    # if not FAST_MODE:
+                                        # log(
+                                        #     f"{self.env.now:.2f}s attacker {receiver.id} forwards to worst {worst.id}"
+                                        # )
                             elif ATTACK_MODE == "rank_increase":
                                 # attacker forwards normally but its rank manipulation causes suboptimal parent selection elsewhere
                                 pass
@@ -231,8 +232,8 @@ class Node:
                         break
                 if sender == sink:
                     sink.pkts_recvd += 1
-                    if not FAST_MODE:
-                        log(f"{self.env.now:.2f}s pkt from {self.id} reached sink")
+                    # if not FAST_MODE:
+                        # log(f"{self.env.now:.2f}s pkt from {self.id} reached sink")
             yield self.env.timeout(pkt_interval + random.uniform(0, 0.2))
 
     # neighbor discovery: one-shot linking within interference range (probabilistic)
@@ -341,7 +342,7 @@ def attack_controller(env, nodes, ATTACK_MODE):
         a.attack_active = True
         if ATTACK_MODE in ("rank_increase", "rank_decrease"):
             a.advertised_rank = 0
-        log(f"{env.now:.2f}s attacker {a.id} ACTIVATED (mode={ATTACK_MODE})")
+        # log(f"{env.now:.2f}s attacker {a.id} ACTIVATED (mode={ATTACK_MODE})")
     # attacks remain active until simulation end
     return
 
@@ -350,113 +351,141 @@ def attack_controller(env, nodes, ATTACK_MODE):
 # Run simulation
 # ---------------------------
 def run():
+    EPOCHS = 1000
     os.makedirs("output", exist_ok=True)
+    results = {}
     # run all
     for ATTACK_MODE in MODES:
-        env = simpy.Environment()
-        
-        scenario = SCENARIOS[ATTACK_MODE]
-        nodes, sink = build_network(env, scenario, ATTACK_MODE)
-        runtime = scenario["runtime"]
+        pdr_list = []
+        plr_list = []
+        energy_list = []
+        for _ in range(EPOCHS):
+            env = simpy.Environment()
+            scenario = SCENARIOS[ATTACK_MODE]
+            nodes, sink = build_network(env, scenario, ATTACK_MODE)
+            runtime = scenario["runtime"]
 
-        # start attack controller
-        env.process(attack_controller(env, nodes, ATTACK_MODE))
-        log("Scenario:", ATTACK_MODE, "nodes:", len(nodes), "runtime(s):", runtime)
-        env.run(until=runtime)
-        # metrics + finalize energy
-        total_energy = 0.0
-        for n in nodes:
-            e = n.finalize_energy(runtime)
-            total_energy += e
-            log(
-                f"{n.id} role={n.role} TX={n.tx_time:.3f}s RX={n.rx_time:.3f}s CPU={n.cpu_time:.3f}s LPM={n.lpm_time:.3f}s ENERGY={e:.6f} mJ pkts_sent={n.pkts_sent} pkts_forwarded={n.pkts_forwarded} pkts_recvd={n.pkts_recvd}"
-            )
-        avg_energy = total_energy / len(nodes) if nodes else 0.0
-        total_pkts_sent = sum(n.pkts_sent for n in nodes)
-        total_pkts_receive = sum(n.pkts_recvd for n in nodes)
-        PKT_LOSS = total_pkts_receive - sink.pkts_recvd
-        plr = (PKT_LOSS / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
-        # pdr = (sink.pkts_recvd / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
-        pdr = (total_pkts_receive / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
-        log(
-            f"SUM_ENERGY={total_energy:.6f} mJ AVG_ENERGY={avg_energy:.6f} mJ PDR={pdr:.2f}% PLR={plr:.2f}"
-        )
+            # start attack controller
+            env.process(attack_controller(env, nodes, ATTACK_MODE))
+            # log("Scenario:", ATTACK_MODE, "nodes:", len(nodes), "runtime(s):", runtime)
+            env.run(until=runtime)
+            # metrics + finalize energy
+            total_energy = 0.0
+            for n in nodes:
+                e = n.finalize_energy(runtime)
+                total_energy += e
+                # log(
+                #     f"{n.id} role={n.role} TX={n.tx_time:.3f}s RX={n.rx_time:.3f}s CPU={n.cpu_time:.3f}s LPM={n.lpm_time:.3f}s ENERGY={e:.6f} mJ pkts_sent={n.pkts_sent} pkts_forwarded={n.pkts_forwarded} pkts_recvd={n.pkts_recvd}"
+                # )
+            avg_energy = total_energy / len(nodes) if nodes else 0.0
+            total_pkts_sent = sum(n.pkts_sent for n in nodes)
+            total_pkts_receive = sum(n.pkts_recvd for n in nodes)
+            PKT_LOSS = total_pkts_receive - sink.pkts_recvd
+            plr = (PKT_LOSS / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
+            # pdr = (sink.pkts_recvd / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
+            pdr = (total_pkts_receive / total_pkts_sent * 100.0) if total_pkts_sent > 0 else 0.0
+            # log(
+            #     f"SUM_ENERGY={total_energy:.6f} mJ AVG_ENERGY={avg_energy:.6f} mJ PDR={pdr:.2f}% PLR={plr:.2f}"
+            # ) 
+            pdr_list.append(pdr)
+            plr_list.append(plr)
+            energy_list.append(avg_energy)
 
-        # quick totals sanity
-        total_tx = sum(n.tx_time for n in nodes)
-        total_rx = sum(n.rx_time for n in nodes)
-        log(
-            f"TOTALS TX={total_tx:.3f}s RX={total_rx:.3f}s PKTS_SENT={total_pkts_sent} PKTS_RECV_AT_SINK={sink.pkts_recvd} PKTS_RECEIVED={total_pkts_receive}"
-        )
+            # quick totals sanity
+            total_tx = sum(n.tx_time for n in nodes)
+            total_rx = sum(n.rx_time for n in nodes)
+            # log(
+            #     f"TOTALS TX={total_tx:.3f}s RX={total_rx:.3f}s PKTS_SENT={total_pkts_sent} PKTS_RECV_AT_SINK={sink.pkts_recvd} PKTS_RECEIVED={total_pkts_receive}"
+            # ) 
 
-        # plots
-        plt.figure(figsize=(7, 7))
-        for n in nodes:
-            if n.role == "sink":
-                s = 160
-                c = "green"
-            elif n.role == "attacker":
-                s = 120
-                c = "red"
-            elif n.role == "mitigation":
-                s = 100
-                c = "orange"
-            else:
-                s = 60
-                c = "blue"
-            plt.scatter(n.pos[0], n.pos[1], s=s, c=c)
-            plt.text(n.pos[0], n.pos[1] - 1.5, n.id, fontsize=6, ha="center")
-            for nb in n.neigh:
-                plt.plot(
-                    [n.pos[0], nb.pos[0]],
-                    [n.pos[1], nb.pos[1]],
-                    color="0.85",
-                    linewidth=0.4,
-                )
-        plt.xlim(0, AREA_W)
-        plt.ylim(0, AREA_H)
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.title(f"Topology: {ATTACK_MODE} (sink green, attacker red)")
-        plt.savefig(f"output/topology_{ATTACK_MODE}.png", dpi=300)
-        plt.close()
-        for n in nodes:
-            children = [x.id for x in nodes if x.parent == n]
-            if children:
-                log(f"{n.id} has children: {children}")
+        pdr_mean = np.mean(pdr_list)
+        pdr_std = np.std(pdr_list)
+        plr_mean = np.mean(plr_list)
+        plr_std = np.std(plr_list)
+        energy_mean = np.mean(energy_list) 
+        energy_std = np.std(energy_list)
 
-        # energy bar
-        ids = [n.id for n in nodes]
-        energies = [n.energy_mJ for n in nodes]
-        order = sorted(range(len(ids)), key=lambda i: energies[i], reverse=True)
-        # order = energies
-        plt.figure(figsize=(10, 4))
-        plt.bar(range(len(ids)), [energies[i] for i in order])
-        plt.xticks(range(len(ids)), [ids[i] for i in order], rotation=90, fontsize=6)
-        plt.ylabel("Energy (mJ)")
-        plt.title(f"Energy per node (PDR {pdr:.2f}%)")
-        plt.tight_layout()
-        plt.savefig(f"output/energy_{ATTACK_MODE}.png", dpi=300)
-        plt.close()
+        results[ATTACK_MODE] = {
+            "PDR_mean": pdr_mean,
+            "PDR_std": pdr_std,
+            "PLR_mean": plr_mean,
+            "PLR_std": plr_std,
+            "Energy_mean": energy_mean,
+            "Energy_std": energy_std,
+        }
 
-        # packeges sent and recevie per node
-        packages_s = [n.pkts_sent for n in nodes]
-        packages_r = [n.pkts_recvd for n in nodes]
-        x = range(len(ids))
-        plt.figure(figsize=(10, 4))
-        plt.plot(x, packages_s, marker='o', label="Sent", alpha=0.6)
-        plt.plot(x, packages_r, marker='s', label="Received", alpha=0.6)
-        plt.xticks(x, ids, rotation=90, fontsize=6)
-        plt.ylabel("Packet Count")
-        plt.title(f"Packets Sent vs Received per Node ({ATTACK_MODE})")
-        plt.legend()
-        plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
-        plt.tight_layout()
-        plt.savefig(f"output/packets_{ATTACK_MODE}.png", dpi=300)
-        plt.close()
-        log("Saved topology.png, energy.png, packages.png")
+            # plots
+            # plt.figure(figsize=(7, 7))
+            # for n in nodes:
+            #     if n.role == "sink":
+            #         s = 160
+            #         c = "green"
+            #     elif n.role == "attacker":
+            #         s = 120
+            #         c = "red"
+            #     elif n.role == "mitigation":
+            #         s = 100
+            #         c = "orange"
+            #     else:
+            #         s = 60
+            #         c = "blue"
+            #     plt.scatter(n.pos[0], n.pos[1], s=s, c=c)
+            #     plt.text(n.pos[0], n.pos[1] - 1.5, n.id, fontsize=6, ha="center")
+            #     for nb in n.neigh:
+            #         plt.plot(
+            #             [n.pos[0], nb.pos[0]],
+            #             [n.pos[1], nb.pos[1]],
+            #             color="0.85",
+            #             linewidth=0.4,
+            #         )
+            # plt.xlim(0, AREA_W)
+            # plt.ylim(0, AREA_H)
+            # plt.gca().set_aspect("equal", adjustable="box")
+            # plt.title(f"Topology: {ATTACK_MODE} (sink green, attacker red)")
+            # plt.savefig(f"output/topology_{ATTACK_MODE}.png", dpi=300)
+            # plt.close()
+            # for n in nodes:
+            #     children = [x.id for x in nodes if x.parent == n]
+            #     if children:
+            #         log(f"{n.id} has children: {children}")
 
-        # space
-        log()
+            # energy bar
+            # ids = [n.id for n in nodes]
+            # energies = [n.energy_mJ for n in nodes]
+            # order = sorted(range(len(ids)), key=lambda i: energies[i], reverse=True)
+            # order = energies
+            # plt.figure(figsize=(10, 4))
+            # plt.bar(range(len(ids)), [energies[i] for i in order])
+            # plt.xticks(range(len(ids)), [ids[i] for i in order], rotation=90, fontsize=6)
+            # plt.ylabel("Energy (mJ)")
+            # plt.title(f"Energy per node (PDR {pdr:.2f}%)")
+            # plt.tight_layout()
+            # plt.savefig(f"output/energy_{ATTACK_MODE}.png", dpi=300)
+            # plt.close()
+
+            # packeges sent and recevie per node
+            # packages_s = [n.pkts_sent for n in nodes]
+            # packages_r = [n.pkts_recvd for n in nodes]
+            # x = range(len(ids))
+            # plt.figure(figsize=(10, 4))
+            # plt.plot(x, packages_s, marker='o', label="Sent", alpha=0.6)
+            # plt.plot(x, packages_r, marker='s', label="Received", alpha=0.6)
+            # plt.xticks(x, ids, rotation=90, fontsize=6)
+            # plt.ylabel("Packet Count")
+            # plt.title(f"Packets Sent vs Received per Node ({ATTACK_MODE})")
+            # plt.legend()
+            # plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+            # plt.tight_layout()
+            # plt.savefig(f"output/packets_{ATTACK_MODE}.png", dpi=300)
+            # plt.close()
+            # log("Saved topology.png, energy.png, packages.png")
+
+            # space
+            # log()
+    for mode, stats in results.items():
+        print(f"{mode:15s}  PDR={stats['PDR_mean']:.2f}±{stats['PDR_std']:.2f}\n"
+            f"PLR={stats['PLR_mean']:.2f}±{stats['PLR_std']:.2f}\n"
+            f"Energy={stats['Energy_mean']:.3f}±{stats['Energy_std']:.3f} mJ\n")
 
 
 if __name__ == "__main__":
